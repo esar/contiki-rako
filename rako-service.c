@@ -37,21 +37,32 @@
 #define EDGE_TIME_MIN 450 /* uS */
 #define EDGE_TIME_MAX 650 /* uS */
 
-#define RAKO_FLAG_RECV_COMPLETE    1
-#define RAKO_FLAG_SEND_COMPLETE    2
+#define RAKO_FLAG_RECV_COMPLETE    (1 << 0)
+#define RAKO_FLAG_SEND_COMPLETE    (1 << 1)
+#define RAKO_FLAG_SEND_TWO         (1 << 2)
 
 PROCESS(rako_process, "RAKO Process");
 
 process_event_t rako_recv_event;
 process_event_t rako_sent_event;
+process_event_t rako_cmd_event;
 
 
 static struct process* g_calling_process = NULL;
+static uint8_t g_send_repeat = 4;
+static uint16_t g_send_repeat_delay = 1;
+
+static rako_msg_t g_send_msg[2];
+static rako_cmd_t g_cmd;
+static uint8_t g_send_index;
+
 static volatile uint8_t g_flags = 0;
-static volatile rako_msg_t g_msg;
+static volatile rako_msg_t g_recv_msg;
 static volatile uint32_t g_msg_data;
 static volatile uint8_t g_msg_data_len;
 static volatile uint8_t g_msg_data_pos;
+static volatile uint8_t g_send_data[16];
+static volatile uint8_t g_delay = 0;
 
 static uint32_t micros()
 {
@@ -112,7 +123,7 @@ ISR(INT6_vect)
       {
         if(g_msg_data_len >= 28)
         {
-          g_msg.raw = g_msg_data << 3;
+          g_recv_msg.raw = g_msg_data << 3;
           g_flags |= RAKO_FLAG_RECV_COMPLETE;
           process_poll(&rako_process);
         }
@@ -177,9 +188,15 @@ ISR(TIMER1_COMPA_vect)
   TCNT1L = 0;
   TCNT1H = 0;
 
+  if(g_delay > 0)
+  {
+    --g_delay;
+    return;
+  }
+
   if(g_msg_data_pos < g_msg_data_len)
   {
-    if((g_msg_data & (1 << (g_msg_data_pos))) != 0)
+    if((g_send_data[g_msg_data_pos / 8] & (1 << (g_msg_data_pos % 8))) != 0)
       PIN_HIGH(RADIO_TX_DATA);
     else
       PIN_LOW(RADIO_TX_DATA);
@@ -200,6 +217,7 @@ inline int rako_is_send_in_progress()
 
 static void send_data_reset()
 {
+  memset((void*)g_send_data, 0, sizeof(g_send_data));
   g_msg_data = 0;
   g_msg_data_len = 0;
   g_msg_data_pos = 0;
@@ -210,13 +228,13 @@ static void send_data_append(const char* bits)
   while(*bits != '\0')
   {
     if(*bits == '1')
-      g_msg_data |= 1 << g_msg_data_len;
+      g_send_data[g_msg_data_len / 8] |= 1 << (g_msg_data_len % 8);
     ++g_msg_data_len;
     ++bits;
   }
 }
 
-void rako_send(rako_msg_t* msg)
+static void rako_send_start(rako_msg_t* msg, int delay)
 {
   int i;
   uint32_t data = msg->raw;
@@ -252,7 +270,158 @@ void rako_send(rako_msg_t* msg)
   // Stop mark
   send_data_append("11110");
 
+  g_delay = delay;
   send_timer_start();
+}
+
+void rako_send(rako_msg_t* msg)
+{
+  g_send_msg[1].raw = msg->raw;
+  g_flags &= ~RAKO_FLAG_SEND_TWO;
+  g_send_index = 1;
+  rako_send_start(&g_send_msg[0], 0);
+}
+
+void rako_send_two(rako_msg_t* msg1, rako_msg_t* msg2)
+{
+  g_send_msg[0].raw = msg1->raw;
+  g_send_msg[1].raw = msg2->raw;
+  g_flags |= RAKO_FLAG_SEND_TWO;
+  g_send_index = 0;
+  rako_send_start(&g_send_msg[0], 0);
+}
+
+void rako_send_scene(int house, int room, int channel, int scene)
+{
+  if(scene <= 4)
+  {
+    rako_msg_t msg = 
+    {
+      .command.type = RAKO_MSG_TYPE_COMMAND,
+      .command.house = house,
+      .command.room = room,
+      .command.channel = channel,
+      .command.command = RAKO_CMD_SCENE1
+    };
+    rako_send(&msg);
+  }
+  else
+  {
+    rako_msg_t cmd = 
+    {
+      .command.type = RAKO_MSG_TYPE_COMMAND,
+      .command.house = house,
+      .command.room = room,
+      .command.channel = channel,
+      .command.command = RAKO_CMD_SCENE_SET
+    };
+    rako_msg_t data = 
+    {
+      .data.type = RAKO_MSG_TYPE_DATA,
+      .data.house = house,
+      .data.data = scene,
+      .data.address = 0
+    };
+    rako_send_two(&cmd, &data);
+  }
+}
+
+void rako_send_off(int house, int room, int channel)
+{
+  rako_msg_t msg = 
+  {
+    .command.type = RAKO_MSG_TYPE_COMMAND,
+    .command.house = house,
+    .command.room = room,
+    .command.channel = channel,
+    .command.command = RAKO_CMD_OFF
+  };
+  rako_send(&msg);
+}
+
+void rako_send_raise(int house, int room, int channel)
+{
+  rako_msg_t msg = 
+  {
+    .command.type = RAKO_MSG_TYPE_COMMAND,
+    .command.house = house,
+    .command.room = room,
+    .command.channel = channel,
+    .command.command = RAKO_CMD_RAISE
+  };
+  rako_send(&msg);
+}
+
+void rako_send_lower(int house, int room, int channel)
+{
+  rako_msg_t msg = 
+  {
+    .command.type = RAKO_MSG_TYPE_COMMAND,
+    .command.house = house,
+    .command.room = room,
+    .command.channel = channel,
+    .command.command = RAKO_CMD_LOWER
+  };
+  rako_send(&msg);
+}
+
+void rako_send_level(int house, int room, int channel, int level)
+{
+    rako_msg_t cmd = 
+    {
+      .command.type = RAKO_MSG_TYPE_COMMAND,
+      .command.house = house,
+      .command.room = room,
+      .command.channel = channel,
+      .command.command = RAKO_CMD_LEVEL_SET
+    };
+    rako_msg_t data = 
+    {
+      .data.type = RAKO_MSG_TYPE_DATA,
+      .data.house = house,
+      .data.data = level,
+      .data.address = 0
+    };
+    rako_send_two(&cmd, &data);
+}
+
+void rako_send_stop(int house, int room, int channel)
+{
+  rako_msg_t msg = 
+  {
+    .command.type = RAKO_MSG_TYPE_COMMAND,
+    .command.house = house,
+    .command.room = room,
+    .command.channel = channel,
+    .command.command = RAKO_CMD_STOP
+  };
+  rako_send(&msg);
+}
+
+void rako_send_ident(int house, int room, int channel)
+{
+  rako_msg_t msg = 
+  {
+    .command.type = RAKO_MSG_TYPE_COMMAND,
+    .command.house = house,
+    .command.room = room,
+    .command.channel = channel,
+    .command.command = RAKO_CMD_IDENT
+  };
+  rako_send(&msg);
+}
+
+void rako_send_store(int house, int room, int channel)
+{
+  rako_msg_t msg = 
+  {
+    .command.type = RAKO_MSG_TYPE_COMMAND,
+    .command.house = house,
+    .command.room = room,
+    .command.channel = channel,
+    .command.command = RAKO_CMD_STORE
+  };
+  rako_send(&msg);
 }
 
 void rako_init()
@@ -266,8 +435,8 @@ void rako_init()
   //disable output compare interrupt (will enable when transmitting)
   BIT_CLR(TIMSK1, OCIE1A);
 
-  EIMSK &= BIT(INT6);  // disable int6, will enable when radio_enable(RADIO_ENABLE_RX);
-  EICRB &= BIT(ISC61); // int 6 triggers on any edge
+  EIMSK &= ~BIT(INT6);  // disable int6, will enable when radio_enable(RADIO_ENABLE_RX);
+  EICRB &= ~BIT(ISC61); // int 6 triggers on any edge
   EICRB |= BIT(ISC60); // "
   EIFR |= BIT(INTF6);  // clear int6 flag
 
@@ -285,7 +454,66 @@ void rako_init()
   g_calling_process = PROCESS_CURRENT();
   rako_recv_event = process_alloc_event();
   rako_sent_event = process_alloc_event();
+  rako_cmd_event = process_alloc_event();
   process_start(&rako_process, NULL);
+}
+
+static int send_complete()
+{
+  if((g_send_index & 1) && g_send_index >> 1 >= g_send_repeat - 1)
+  {
+    process_post(g_calling_process, rako_sent_event, NULL);
+    return 0;
+  }
+  else
+  {
+    if(g_flags & RAKO_FLAG_SEND_TWO)
+      return g_send_index + 1;
+    else
+      return g_send_index + 2;
+  }
+}
+
+static void recv_complete()
+{
+  process_post(g_calling_process, rako_recv_event, (void*)&g_recv_msg);
+
+  if(g_recv_msg.unknown.type == RAKO_MSG_TYPE_COMMAND)
+  {
+    g_cmd.house = g_recv_msg.command.house;
+    g_cmd.room = g_recv_msg.command.room;
+    g_cmd.channel = g_recv_msg.command.channel;
+    g_cmd.command = g_recv_msg.command.command;
+
+    if(!(g_recv_msg.command.command == RAKO_CMD_LEVEL_SET || 
+         g_recv_msg.command.command == RAKO_CMD_SCENE_SET || 
+         g_recv_msg.command.command == RAKO_CMD_EEPROM_WRITE))
+    {
+      g_cmd.data = 0;
+      g_cmd.address = 0;
+
+      if(g_recv_msg.command.command >= RAKO_CMD_SCENE1 && g_recv_msg.command.command <= RAKO_CMD_SCENE4)
+      {
+        g_cmd.command = RAKO_CMD_SCENE_SET;
+        g_cmd.data = 1 + (g_recv_msg.command.command - RAKO_CMD_SCENE1);
+      }
+
+      process_post(g_calling_process, rako_cmd_event, (void*)&g_cmd);
+    }
+  }
+  else if(g_recv_msg.unknown.type == RAKO_MSG_TYPE_DATA)
+  {
+    if(g_cmd.house == g_recv_msg.data.house)
+    {
+      g_cmd.data = g_recv_msg.data.data;
+      g_cmd.address = g_recv_msg.data.address;
+      process_post(g_calling_process, rako_cmd_event, (void*)&g_cmd);
+    }
+    else
+      g_cmd.house = 0;
+  }
+  else
+    g_cmd.house = 0;
 }
 
 PROCESS_THREAD(rako_process, ev, data)
@@ -294,17 +522,22 @@ PROCESS_THREAD(rako_process, ev, data)
 
   for(;;)
   {
-    PROCESS_WAIT_EVENT_UNTIL(ev == PROCESS_EVENT_POLL);
+    PROCESS_WAIT_EVENT();
 
-    if(g_flags & RAKO_FLAG_RECV_COMPLETE)
+    if(ev == PROCESS_EVENT_POLL)
     {
-      g_flags &= ~RAKO_FLAG_RECV_COMPLETE;
-      process_post(g_calling_process, rako_recv_event, (void*)&g_msg);
-    }
-    else
-    {
-      g_flags &= ~RAKO_FLAG_SEND_COMPLETE;
-      process_post(g_calling_process, rako_sent_event, NULL);
+      if(g_flags & RAKO_FLAG_RECV_COMPLETE)
+      {
+        g_flags &= ~RAKO_FLAG_RECV_COMPLETE;
+        recv_complete();
+      }
+      else if(g_flags & RAKO_FLAG_SEND_COMPLETE)
+      {
+        g_flags &= ~RAKO_FLAG_SEND_COMPLETE;
+        g_send_index = send_complete();
+        if(g_send_index != 0)
+          rako_send_start(&g_send_msg[g_send_index & 1], 128);
+      }
     }
   }
 
